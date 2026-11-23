@@ -231,9 +231,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         me = await context.bot.get_me()
+        minutes = max(1, IMAGE_COOLDOWN // 60)
         await update.effective_message.reply_text(
-            f"Привет! Я {me.first_name}. Обратись ко мне по имени (@{me.username}) "
-            "или процитируй моё сообщение — отвечу. Попроси «нарисуй …» — сгенерирую картинку."
+            f"Привет! Я {me.first_name} — ИИ-ассистент в этом чате.\n\n"
+            "Что я умею:\n"
+            f"• Отвечать на вопросы: обратись ко мне по имени (@{me.username} или просто «{me.first_name}») "
+            "или процитируй моё сообщение;\n"
+            "• Помнить контекст нашего разговора в этом чате;\n"
+            f"• Рисовать картинки по запросу «нарисуй …» — но не чаще раза в {minutes} мин.\n\n"
+            f"Попробуй: «@{me.username}, привет!» или «@{me.username}, нарисуй котика»"
         )
 
 
