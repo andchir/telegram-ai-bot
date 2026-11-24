@@ -166,13 +166,19 @@ def build_prompt(text: str, message) -> str:
 
 
 def extract_image(data) -> tuple[str, str] | None:
-    """Ищем в ответе медиа-API ('url' или 'b64_json'/'base64') рекурсивно."""
+    """Ищем в ответе медиа-API ('url'/'resultUrls' или 'b64_json'/'base64') рекурсивно."""
     if isinstance(data, dict):
         for key in ("url", "image_url", "b64_json", "base64"):
             value = data.get(key)
             if isinstance(value, str) and value:
                 kind = "url" if key in ("url", "image_url") else "b64"
                 return kind, value
+        for key in ("resultUrls", "urls", "result_url"):
+            value = data.get(key)
+            if isinstance(value, (list, tuple)) and value and isinstance(value[0], str):
+                return "url", value[0]
+            if isinstance(value, str) and value:
+                return "url", value
         for value in data.values():
             found = extract_image(value)
             if found:
@@ -287,7 +293,7 @@ async def generate_image(prompt: str, on_tick=None) -> tuple[str, str] | None:
             except ValueError:
                 log.error("Джоб-API вернул не-JSON (HTTP %s): %.1000s", poll.status_code, poll.text)
                 return None
-            status = str(job.get("status", "")).lower()
+            status = str(job.get("status") or job.get("stage") or "").lower()
             if status in JOB_DONE_STATUSES:
                 image = extract_image(job)
                 if image is None:
@@ -350,7 +356,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             kind, value = image
             if kind == "url":
                 async with httpx.AsyncClient(timeout=120.0) as client:
-                    img_bytes = (await client.get(value)).content
+                    img_bytes = (
+                        await client.get(
+                            value,
+                            headers={"Authorization": f"Bearer {PLUSVIBE_API_KEY}"},
+                        )
+                    ).content
             else:
                 img_bytes = base64.b64decode(value)
             caption = f"🎨 Запрос от {user.full_name}: {text}"
