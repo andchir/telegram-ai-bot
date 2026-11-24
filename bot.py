@@ -225,7 +225,14 @@ def md_to_tg_html(text: str) -> str:
     text = re.sub(r"(\S)\[([^\]]+)\]\((https?://)", r"\1 [\2](\3", text)
 
     out = html.escape(text, quote=False)
-    out = re.sub(r"```\w*\n(.*?)\n?```", r"<pre>\1</pre>", out, flags=re.S)
+    # спрятать блоки кода: их разметку (решётки комментариев и т.п.) не трогаем
+    blocks: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        blocks.append(m.group(1))
+        return f"\x00{len(blocks) - 1}\x00"
+
+    out = re.sub(r"```\w*\n(.*?)\n?```", _stash, out, flags=re.S)
     # URL допускаем сбалансированные скобки: ru.wikipedia.org/wiki/Что-то_(фильм)
     out = re.sub(
         r"\[([^\]]+)\]\((https?://[^\s()]+(?:\([^)\s]*\)[^\s()]*)*)\)",
@@ -236,7 +243,9 @@ def md_to_tg_html(text: str) -> str:
     out = re.sub(r"__(.+?)__", r"<b>\1</b>", out, flags=re.S)
     out = re.sub(r"(?<![\w<])\*([^*\n]+)\*(?![\w>])", r"<i>\1</i>", out)
     out = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", out)
+    out = re.sub(r"(?m)^#{1,6}\s*(.+?)\s*#*\s*$", r"<b>\1</b>", out)
     out = re.sub(r"(?im)^\s*(источники:?)\s*$", r"<b>\1</b>", out)
+    out = re.sub(r"\x00(\d+)\x00", lambda m: "<pre>" + blocks[int(m.group(1))] + "</pre>", out)
     return out
 
 
