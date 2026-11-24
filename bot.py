@@ -53,6 +53,9 @@ WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip() or None
 
 # Антиспам генерации картинок: минимальный интервал между генерациями, секунды
 IMAGE_COOLDOWN = int(os.getenv("IMAGE_COOLDOWN_SECONDS", "600"))
+# Асинхронная генерация: интервал опроса джобы и общий таймаут ожидания, секунды
+IMAGE_POLL_INTERVAL = float(os.getenv("IMAGE_POLL_INTERVAL", "5"))
+IMAGE_JOB_TIMEOUT = int(os.getenv("IMAGE_JOB_TIMEOUT", "300"))
 DEFAULT_COOLDOWN_PHRASES = (
     "Кисти отдыхают — я не волшебник, я просто бот.",
     "Холст ещё сохнет, дай мне передышку.",
@@ -231,14 +234,26 @@ async def fact_check(text: str) -> str:
         return data["choices"][0]["message"]["content"].strip()
 
 
-async def generate_image(prompt: str) -> tuple[str, str] | None:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+# Джоба генерации считается завершённой/ failed по этим статусам
+JOB_DONE_STATUSES = {"completed", "complete", "done", "success", "succeeded"}
+JOB_FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
+
+
+async def generate_image(prompt: str, on_tick=None) -> tuple[str, str] | None:
+    """Создаём джобу генерации и опрашиваем её до завершения.
+
+    API асинхронный: POST /api/media/generate возвращает jobId,
+    результат — через GET /api/media/jobs/{id}. on_tick — колбэк для
+    «живого» индикатора в чате на каждом цикле опроса.
+    """
+    headers = {
+        "Authorization": f"Bearer {PLUSVIBE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
         resp = await client.post(
             f"{PLUSVIBE_BASE}/api/media/generate",
-            headers={
-                "Authorization": f"Bearer {PLUSVIBE_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json={
                 "model": IMAGE_MODEL,
                 "prompt": prompt,
@@ -247,14 +262,43 @@ async def generate_image(prompt: str) -> tuple[str, str] | None:
         )
         resp.raise_for_status()
         try:
-            data = resp.json()
+            job = resp.json()
         except ValueError:
             log.error("Медиа-API вернул не-JSON ответ (HTTP %s): %.1000s", resp.status_code, resp.text)
             return None
-        image = extract_image(data)
-        if image is None:
-            log.error("Не распознан формат ответа медиа-API: %.1000s", resp.text)
-        return image
+
+        job_id = job.get("jobId") or job.get("id")
+        if not job_id:
+            # вдруг API вернул готовый результат без джобы
+            image = extract_image(job)
+            if image is None:
+                log.error("Не распознан формат ответа медиа-API: %.1000s", resp.text)
+            return image
+
+        deadline = time.monotonic() + IMAGE_JOB_TIMEOUT
+        while True:
+            await asyncio.sleep(IMAGE_POLL_INTERVAL)
+            if on_tick is not None:
+                await on_tick()
+            poll = await client.get(f"{PLUSVIBE_BASE}/api/media/jobs/{job_id}", headers=headers)
+            poll.raise_for_status()
+            try:
+                job = poll.json()
+            except ValueError:
+                log.error("Джоб-API вернул не-JSON (HTTP %s): %.1000s", poll.status_code, poll.text)
+                return None
+            status = str(job.get("status", "")).lower()
+            if status in JOB_DONE_STATUSES:
+                image = extract_image(job)
+                if image is None:
+                    log.error("Джоба %s завершена, но результат не распознан: %.1000s", job_id, poll.text)
+                return image
+            if status in JOB_FAILED_STATUSES:
+                log.error("Джоба %s завершилась со статусом %r: %.1000s", job_id, status, poll.text)
+                return None
+            if time.monotonic() > deadline:
+                log.error("Таймаут ожидания джобы %s (%s сек)", job_id, IMAGE_JOB_TIMEOUT)
+                return None
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -295,7 +339,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 reply_parameters=ReplyParameters(message_id=message.message_id),
             )
             await message.chat.send_action(ChatAction.UPLOAD_PHOTO)
-            image = await generate_image(prompt)
+
+            async def _tick():  # держим индикатор «загружает фото» на каждом цикле опроса
+                await message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+
+            image = await generate_image(prompt, on_tick=_tick)
             if image is None:
                 await ack.edit_text("Не смог разобрать ответ генератора картинок 😔")
                 return
