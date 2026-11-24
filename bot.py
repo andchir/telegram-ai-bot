@@ -537,7 +537,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         _history[chat.id].append({"role": "assistant", "content": answer})
     except httpx.HTTPStatusError as e:
         log.error("HTTP %s от API: %s", e.response.status_code, e.response.text[:500])
-        await _reply_error(message, ack, "Упс, API вернул ошибку. Попробуй ещё раз чуть позже.")
+        await _reply_error(message, ack, "Упс, у меня не получилось выполнить запрос. Попробуй ещё раз чуть позже.")
     except Exception as e:  # заглушка не должна остаться без ответа
         log.error("Ошибка: %s", e)
         await _reply_error(message, ack, "Что-то пошло не так 🤖")
