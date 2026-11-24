@@ -214,6 +214,7 @@ def md_to_tg_html(text: str) -> str:
     text = re.sub(r"(\S)\[([^\]]+)\]\((https?://)", r"\1 [\2](\3", text)
 
     out = html.escape(text, quote=False)
+    out = re.sub(r"```\w*\n(.*?)\n?```", r"<pre>\1</pre>", out, flags=re.S)
     # URL допускаем сбалансированные скобки: ru.wikipedia.org/wiki/Что-то_(фильм)
     out = re.sub(
         r"\[([^\]]+)\]\((https?://[^\s()]+(?:\([^)\s]*\)[^\s()]*)*)\)",
@@ -445,7 +446,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         answer = await ask_llm([{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": prompt}])
         if not answer:
             answer = "…"
-        await message.reply_text(answer, reply_parameters=ReplyParameters(message_id=message.message_id))
+        await send_formatted(
+            message,
+            answer,
+            reply_parameters=ReplyParameters(message_id=message.message_id),
+        )
         _history[chat.id].append({"role": "user", "content": prompt})
         _history[chat.id].append({"role": "assistant", "content": answer})
     except httpx.HTTPStatusError as e:
@@ -462,6 +467,16 @@ async def _reply_error(message, ack, text: str) -> None:
         await ack.edit_text(text)
     else:
         await message.reply_text(text)
+
+
+async def send_formatted(message, text: str, **kwargs) -> None:
+    """Отправка ответа: Markdown модели -> HTML Telegram; при ошибке парсинга - plain text."""
+    try:
+        await message.reply_text(
+            safe_truncate_html(md_to_tg_html(text)), parse_mode=ParseMode.HTML, **kwargs
+        )
+    except TelegramError:
+        await message.reply_text(md_to_plain(text)[:4000], **kwargs)
 
 
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
