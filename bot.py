@@ -6,6 +6,7 @@ API: PlusVibe (https://plusvibeapi.ru) — чат gpt-6.1-sol, генераци�
 
 import asyncio
 import base64
+import html
 import io
 import logging
 import logging.handlers
@@ -18,7 +19,7 @@ from collections import defaultdict, deque
 import httpx
 from dotenv import load_dotenv
 from telegram import InputMediaPhoto, ReplyParameters, Update
-from telegram.constants import ChatAction, ChatType
+from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -28,7 +29,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 PLUSVIBE_API_KEY = os.getenv("PLUSVIBE_API_KEY", "").strip()
 PLUSVIBE_BASE = os.getenv("PLUSVIBE_BASE", "https://plusvibeapi.ru").rstrip("/")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-6-luna")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2:white")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2:network")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "Ты — дружелюбный ИИ-ассистент в Telegram-чате. Отвечай по делу, живо и с юмором.",
@@ -89,9 +90,14 @@ FACTCHECK_MODEL = os.getenv("FACTCHECK_MODEL", "perplexity/sonar")
 FACTCHECK_SYSTEM_PROMPT = os.getenv(
     "FACTCHECK_SYSTEM_PROMPT",
     "Ты - профессиональный факт-чекер. Твоя задача - проверять новостные утверждения "
-    "на достоверность, опираясь на надежные источники. Отвечай структурированно: указывай "
-    "статус проверки (Правда / Ложь / Вводяще в заблуждение / Не подтверждено), приводи "
-    "краткое объяснение и ссылки на источники.",
+    "на достоверность, опираясь на надежные источники. Отвечай структурированно:\n"
+    "1) Статус проверки (Правда / Ложь / Вводяще в заблуждение / Не подтверждено) и краткое объяснение.\n"
+    "2) В объяснении ссылайся на источники номерами в квадратных скобках: [1], [2] и т.д. "
+    "Нумерация - строго по порядку первого упоминания, без пропусков.\n"
+    "3) В конце обязательный блок «Источники:» с НУМЕРОВАННЫМ списком: "
+    "«1. [название](https://реальный-url)». Номер в списке должен точно совпадать с номером "
+    "в тексте: каждому [N] в тексте - ровно одна ссылка N в списке. "
+    "Ссылки давай только полными URL в формате Markdown.",
 ).strip()
 
 def setup_logging() -> None:
@@ -199,6 +205,44 @@ def format_remaining(seconds: float) -> str:
     if minutes:
         return f"{minutes} мин"
     return f"{secs} сек"
+
+
+def md_to_tg_html(text: str) -> str:
+    """Минимальная конвертация Markdown из ответа модели в HTML Telegram."""
+    # модель часто склеивает ссылки: "слово[a](u1)[b](u2)" -> "слово [a](u1) [b](u2)"
+    text = re.sub(r"\]\((https?://[^)\s]+)\)(?=\[)", r"](\1) ", text)
+    text = re.sub(r"(\S)\[([^\]]+)\]\((https?://)", r"\1 [\2](\3", text)
+
+    out = html.escape(text, quote=False)
+    # URL допускаем сбалансированные скобки: ru.wikipedia.org/wiki/Что-то_(фильм)
+    out = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s()]+(?:\([^)\s]*\)[^\s()]*)*)\)",
+        r'<a href="\2">\1</a>',
+        out,
+    )
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out, flags=re.S)
+    out = re.sub(r"__(.+?)__", r"<b>\1</b>", out, flags=re.S)
+    out = re.sub(r"(?<![\w<])\*([^*\n]+)\*(?![\w>])", r"<i>\1</i>", out)
+    out = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", out)
+    out = re.sub(r"(?im)^\s*(источники:?)\s*$", r"<b>\1</b>", out)
+    return out
+
+
+def safe_truncate_html(text: str, limit: int = 3900) -> str:
+    """Обрезка HTML лимиту Telegram без разрыва тега."""
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 2]
+    last_lt, last_gt = cut.rfind("<"), cut.rfind(">")
+    if last_lt > last_gt:  # обрезали посередине тега — отбрасываем его начало
+        cut = cut[:last_lt]
+    return cut.rstrip() + " …"
+
+
+def md_to_plain(text: str) -> str:
+    """Запасной вариант для обычного текста: убираем markdown-разметку."""
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", text)
+    return text.replace("**", "").replace("__", "")
 
 
 async def ask_llm(messages: list[dict]) -> str:
@@ -387,7 +431,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             await message.chat.send_action(ChatAction.TYPING)
             verdict = await fact_check(prompt)
-            await ack.edit_text(verdict[:4000])  # лимит Telegram — 4096 символов
+            formatted = md_to_tg_html(verdict)
+            try:
+                await ack.edit_text(safe_truncate_html(formatted), parse_mode=ParseMode.HTML)
+            except TelegramError:  # не разобрали markdown — шлём упрощённый текст
+                await ack.edit_text(md_to_plain(verdict)[:4000])
             _history[chat.id].append({"role": "user", "content": prompt})
             _history[chat.id].append({"role": "assistant", "content": verdict[:4000]})
             return
