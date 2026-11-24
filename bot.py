@@ -8,6 +8,7 @@ import asyncio
 import base64
 import io
 import logging
+import logging.handlers
 import os
 import random
 import re
@@ -17,7 +18,7 @@ from collections import defaultdict, deque
 import httpx
 from dotenv import load_dotenv
 from telegram import InputMediaPhoto, ReplyParameters, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ChatType
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -36,6 +37,11 @@ BOT_NAME = os.getenv("BOT_NAME", "").strip()  # доп. имя для обращ
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 # Лимит токенов на ответ основной модели; 0 = не ограничивать (параметр не отправляется)
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "0"))
+
+# Логирование: файл с ротацией по размеру; пустой LOG_FILE = только консоль
+LOG_FILE = os.getenv("LOG_FILE", "bot.log").strip()
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+LOG_BACKUPS = int(os.getenv("LOG_BACKUPS", "3"))
 
 # Режим запуска: polling (по умолчанию, для локального запуска) или webhook
 BOT_MODE = os.getenv("BOT_MODE", "polling").strip().lower()
@@ -85,10 +91,31 @@ FACTCHECK_SYSTEM_PROMPT = os.getenv(
     "краткое объяснение и ссылки на источники.",
 ).strip()
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
+def setup_logging() -> None:
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    if LOG_FILE:
+        try:
+            file_handler = logging.handlers.RotatingFileHandler(
+                LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"
+            )
+        except OSError as e:
+            root.warning("Не удалось открыть файл лога %s: %s", LOG_FILE, e)
+            return
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
+    # иначе каждый HTTP-запрос (httpx) — отдельная строка в логе
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+setup_logging()
 log = logging.getLogger("telegram-ai-bot")
 
 # Короткая память диалога на чат: chat_id -> очередь сообщений {role, content}
@@ -219,7 +246,15 @@ async def generate_image(prompt: str) -> tuple[str, str] | None:
             },
         )
         resp.raise_for_status()
-        return extract_image(resp.json())
+        try:
+            data = resp.json()
+        except ValueError:
+            log.error("Медиа-API вернул не-JSON ответ (HTTP %s): %.1000s", resp.status_code, resp.text)
+            return None
+        image = extract_image(data)
+        if image is None:
+            log.error("Не распознан формат ответа медиа-API: %.1000s", resp.text)
+        return image
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -231,7 +266,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     me = await context.bot.get_me()
-    triggered = is_reply_to_bot(message, me.id) or mentions_bot(message.text, me.username, me.first_name)
+    # В личке отвечаем на любое сообщение; в группах — только по имени или цитате
+    triggered = (
+        chat.type == ChatType.PRIVATE
+        or is_reply_to_bot(message, me.id)
+        or mentions_bot(message.text, me.username, me.first_name)
+    )
     if not triggered:
         return
 
@@ -324,8 +364,9 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             f"Привет! Я {me.first_name} — ИИ-ассистент в этом чате.\n\n"
             "Что я умею:\n"
-            f"• Отвечать на вопросы: обратись ко мне по имени (@{me.username} или просто «{me.first_name}») "
-            "или процитируй моё сообщение;\n"
+            "• В личке отвечаю на любое сообщение;\n"
+            f"• В группах — когда обратятся по имени (@{me.username} или просто «{me.first_name}») "
+            "или процитируют моё сообщение;\n"
             "• Помнить контекст нашего разговора в этом чате;\n"
             f"• Рисовать картинки по запросу «нарисуй …» — но не чаще раза в {minutes} мин;\n"
             "• Проверять утверждения на достоверность: спроси «правда ли, что …» — найду источники.\n\n"
