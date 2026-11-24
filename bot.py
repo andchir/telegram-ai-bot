@@ -148,6 +148,15 @@ FACTCHECK_TRIGGER_RE = re.compile(
     r"fact[\s-]?check|is\s+it\s+true)\b"
 )
 
+# Ключевые слова правки изображения (работают с процитированной картинкой)
+IMAGE_EDIT_RE = re.compile(
+    r"(?i)"
+    r"\b(добавь(те)?|замени(те)?|поменяй(те)?|убери(те)?|удали(те)?|исправь(те)?|"
+    r"измени(те)?|переделай(те)?|перекрась(те)?|дорисуй(те)?|поправь(те)?|"
+    r"сделай\s+(его|е[ёе]|ярче|темнее|ч[её]рно|цветн)|в\s+стиле|"
+    r"edit|replace|remove|change|redraw|make\s+it)\b"
+)
+
 
 def mentions_bot(text: str, username: str, first_name: str) -> bool:
     """Обращение по имени: @username, username или имя бота как слово."""
@@ -292,21 +301,56 @@ JOB_DONE_STATUSES = {"completed", "complete", "done", "success", "succeeded"}
 JOB_FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
 
 
-async def generate_image(prompt: str, on_tick=None) -> tuple[str, str] | None:
-    """Создаём джобу генерации и опрашиваем её до завершения.
+def _extract_job_id(resp) -> str | None:
+    """jobId из тела ответа или заголовка x-pv-media-job-id."""
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        job_id = data.get("jobId") or data.get("id")
+        if job_id:
+            return str(job_id)
+    header_id = resp.headers.get("x-pv-media-job-id")
+    return str(header_id) if header_id else None
 
-    API асинхронный: POST /api/media/generate возвращает jobId,
-    результат — через GET /api/media/jobs/{id}. on_tick — колбэк для
-    «живого» индикатора в чате на каждом цикле опроса.
-    """
-    headers = {
-        "Authorization": f"Bearer {PLUSVIBE_API_KEY}",
-        "Content-Type": "application/json",
-    }
+
+async def _poll_job(client, job_id: str, on_tick) -> tuple[str, str] | None:
+    """Опрос джобы до завершения; on_tick - колбэк для индикатора в чате."""
+    headers = {"Authorization": f"Bearer {PLUSVIBE_API_KEY}"}
+    deadline = time.monotonic() + IMAGE_JOB_TIMEOUT
+    while True:
+        await asyncio.sleep(IMAGE_POLL_INTERVAL)
+        if on_tick is not None:
+            await on_tick()
+        poll = await client.get(f"{PLUSVIBE_BASE}/api/media/jobs/{job_id}", headers=headers)
+        poll.raise_for_status()
+        try:
+            job = poll.json()
+        except ValueError:
+            log.error("Джоб-API вернул не-JSON (HTTP %s): %.1000s", poll.status_code, poll.text)
+            return None
+        status = str(job.get("status") or job.get("stage") or "").lower()
+        if status in JOB_DONE_STATUSES:
+            image = extract_image(job)
+            if image is None:
+                log.error("Джоба %s завершена, но результат не распознан: %.1000s", job_id, poll.text)
+            return image
+        if status in JOB_FAILED_STATUSES:
+            log.error("Джоба %s завершилась со статусом %r: %.1000s", job_id, status, poll.text)
+            return None
+        if time.monotonic() > deadline:
+            log.error("Таймаут ожидания джобы %s (%s сек)", job_id, IMAGE_JOB_TIMEOUT)
+            return None
+
+
+async def generate_image(prompt: str, on_tick=None) -> tuple[str, str] | None:
+    """Генерация картинки: POST /api/media/generate, затем опрос джобы."""
+    headers = {"Authorization": f"Bearer {PLUSVIBE_API_KEY}"}
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
         resp = await client.post(
             f"{PLUSVIBE_BASE}/api/media/generate",
-            headers=headers,
+            headers={**headers, "Content-Type": "application/json"},
             json={
                 "model": IMAGE_MODEL,
                 "prompt": prompt,
@@ -314,44 +358,44 @@ async def generate_image(prompt: str, on_tick=None) -> tuple[str, str] | None:
             },
         )
         resp.raise_for_status()
+        job_id = _extract_job_id(resp)
+        if job_id:
+            return await _poll_job(client, job_id, on_tick)
+        # вдруг API вернул готовый результат без джобы
         try:
-            job = resp.json()
+            data = resp.json()
         except ValueError:
             log.error("Медиа-API вернул не-JSON ответ (HTTP %s): %.1000s", resp.status_code, resp.text)
             return None
+        image = extract_image(data)
+        if image is None:
+            log.error("Не распознан формат ответа медиа-API: %.1000s", resp.text)
+        return image
 
-        job_id = job.get("jobId") or job.get("id")
-        if not job_id:
-            # вдруг API вернул готовый результат без джобы
-            image = extract_image(job)
-            if image is None:
-                log.error("Не распознан формат ответа медиа-API: %.1000s", resp.text)
-            return image
 
-        deadline = time.monotonic() + IMAGE_JOB_TIMEOUT
-        while True:
-            await asyncio.sleep(IMAGE_POLL_INTERVAL)
-            if on_tick is not None:
-                await on_tick()
-            poll = await client.get(f"{PLUSVIBE_BASE}/api/media/jobs/{job_id}", headers=headers)
-            poll.raise_for_status()
-            try:
-                job = poll.json()
-            except ValueError:
-                log.error("Джоб-API вернул не-JSON (HTTP %s): %.1000s", poll.status_code, poll.text)
-                return None
-            status = str(job.get("status") or job.get("stage") or "").lower()
-            if status in JOB_DONE_STATUSES:
-                image = extract_image(job)
-                if image is None:
-                    log.error("Джоба %s завершена, но результат не распознан: %.1000s", job_id, poll.text)
-                return image
-            if status in JOB_FAILED_STATUSES:
-                log.error("Джоба %s завершилась со статусом %r: %.1000s", job_id, status, poll.text)
-                return None
-            if time.monotonic() > deadline:
-                log.error("Таймаут ожидания джобы %s (%s сек)", job_id, IMAGE_JOB_TIMEOUT)
-                return None
+async def edit_image(prompt: str, image_bytes: bytes, on_tick=None) -> tuple[str, str] | None:
+    """Правка исходного изображения: multipart в POST /v1/images/edits, затем опрос джобы."""
+    headers = {"Authorization": f"Bearer {PLUSVIBE_API_KEY}"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        resp = await client.post(
+            f"{PLUSVIBE_BASE}/v1/images/edits",
+            headers=headers,
+            files={"image": ("image.png", image_bytes, "image/png")},
+            data={"prompt": prompt, "model": IMAGE_MODEL},
+        )
+        resp.raise_for_status()
+        job_id = _extract_job_id(resp)
+        if job_id:
+            return await _poll_job(client, job_id, on_tick)
+        try:
+            data = resp.json()
+        except ValueError:
+            log.error("Edit-API вернул не-JSON (HTTP %s): %.1000s", resp.status_code, resp.text)
+            return None
+        image = extract_image(data)
+        if image is None:
+            log.error("Не распознан формат ответа edit-API: %.1000s", resp.text)
+        return image
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -376,7 +420,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ack = None  # заглушка, отправленная сразу; по завершении редактируется в результат
 
     try:
-        if IMAGE_TRIGGER_RE.search(text):
+        # правка картинки: к запросу процитировано сообщение с фото + слова правки
+        edit_photo = None
+        if message.reply_to_message is not None and IMAGE_EDIT_RE.search(text):
+            if message.reply_to_message.photo:
+                edit_photo = message.reply_to_message.photo[-1]
+
+        if IMAGE_TRIGGER_RE.search(text) or edit_photo is not None:
             # лимит на генерацию свой для каждого пользователя в личке
             # и для каждой группы, если бот в группе
             scope = ("user", user.id) if chat.type == ChatType.PRIVATE else ("chat", chat.id)
@@ -399,7 +449,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             async def _tick():  # держим индикатор «загружает фото» на каждом цикле опроса
                 await message.chat.send_action(ChatAction.UPLOAD_PHOTO)
 
-            image = await generate_image(prompt, on_tick=_tick)
+            if edit_photo is not None:
+                caption = f"✏️ Отредактировано по запросу от {user.full_name}: {text}"
+                note = f"[отредактировал картинку по запросу: {text}]"
+                tg_file = await context.bot.get_file(edit_photo.file_id)
+                async with httpx.AsyncClient(timeout=60.0) as dl:
+                    photo_bytes = (await dl.get(tg_file.file_path)).content
+                image = await edit_image(prompt, photo_bytes, on_tick=_tick)
+            else:
+                caption = f"🎨 Запрос от {user.full_name}: {text}"
+                note = f"[нарисовал картинку по запросу: {text}]"
+                image = await generate_image(prompt, on_tick=_tick)
             if image is None:
                 await ack.edit_text("Не смог разобрать ответ генератора картинок 😔")
                 return
@@ -414,7 +474,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     ).content
             else:
                 img_bytes = base64.b64decode(value)
-            caption = f"🎨 Запрос от {user.full_name}: {text}"
             try:
                 # заглушка превращается в картинку — цитата запроса сохраняется
                 await ack.edit_media(media=InputMediaPhoto(io.BytesIO(img_bytes), caption=caption[:1024]))
@@ -427,7 +486,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
             _last_image_at[scope] = time.monotonic()  # фиксируем только успешную генерацию
             _history[chat.id].append({"role": "user", "content": prompt})
-            _history[chat.id].append({"role": "assistant", "content": f"[нарисовал картинку по запросу: {text}]"})
+            _history[chat.id].append({"role": "assistant", "content": note})
             return
 
         if FACTCHECK_TRIGGER_RE.search(text):
