@@ -16,8 +16,9 @@ from collections import defaultdict, deque
 
 import httpx
 from dotenv import load_dotenv
-from telegram import ReplyParameters, Update
+from telegram import InputMediaPhoto, ReplyParameters, Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
@@ -25,7 +26,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 PLUSVIBE_API_KEY = os.getenv("PLUSVIBE_API_KEY", "").strip()
 PLUSVIBE_BASE = os.getenv("PLUSVIBE_BASE", "https://plusvibeapi.ru").rstrip("/")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-6.1-sol")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-6-luna")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2:white")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
@@ -56,7 +57,21 @@ IMAGE_COOLDOWN_PHRASES = [
     for p in os.getenv("IMAGE_COOLDOWN_PHRASES", "|".join(DEFAULT_COOLDOWN_PHRASES)).split("|")
     if p.strip()
 ] or list(DEFAULT_COOLDOWN_PHRASES)
-_last_image_at = 0.0  # момент последней успешной генерации (time.monotonic)
+_last_image_at: float | None = None  # момент последней успешной генерации (time.monotonic)
+
+# Мгновенные заглушки, пока бот выполняет долгую операцию (генерация картинки)
+DEFAULT_ACK_PHRASES = (
+    "Уже берусь за дело!",
+    "Принято, работаю над этим…",
+    "Секундочку, творю!",
+    "Хорошо, щас всё будет.",
+    "Задача принята, начинаю.",
+)
+ACK_PHRASES = [
+    p.strip()
+    for p in os.getenv("ACK_PHRASES", "|".join(DEFAULT_ACK_PHRASES)).split("|")
+    if p.strip()
+] or list(DEFAULT_ACK_PHRASES)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -178,11 +193,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     text = message.text
     prompt = build_prompt(text, message)
+    ack = None  # заглушка, отправленная сразу; по завершении редактируется в результат
 
     try:
         if IMAGE_TRIGGER_RE.search(text):
             now = time.monotonic()
-            if now - _last_image_at < IMAGE_COOLDOWN:
+            if _last_image_at is not None and now - _last_image_at < IMAGE_COOLDOWN:
                 remaining = IMAGE_COOLDOWN - (now - _last_image_at)
                 phrase = random.choice(IMAGE_COOLDOWN_PHRASES)
                 await message.reply_text(
@@ -190,10 +206,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     reply_parameters=ReplyParameters(message_id=message.message_id),
                 )
                 return
+            ack = await message.reply_text(
+                random.choice(ACK_PHRASES),
+                reply_parameters=ReplyParameters(message_id=message.message_id),
+            )
             await message.chat.send_action(ChatAction.UPLOAD_PHOTO)
             image = await generate_image(prompt)
             if image is None:
-                await message.reply_text("Не смог разобрать ответ генератора картинок 😔")
+                await ack.edit_text("Не смог разобрать ответ генератора картинок 😔")
                 return
             kind, value = image
             if kind == "url":
@@ -202,11 +222,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             else:
                 img_bytes = base64.b64decode(value)
             caption = f"🎨 Запрос от {user.full_name}: {text}"
-            await message.reply_photo(
-                photo=io.BytesIO(img_bytes),
-                caption=caption[:1024],
-                reply_parameters=ReplyParameters(message_id=message.message_id),
-            )
+            try:
+                # заглушка превращается в картинку — цитата запроса сохраняется
+                await ack.edit_media(media=InputMediaPhoto(io.BytesIO(img_bytes), caption=caption[:1024]))
+            except TelegramError:
+                await ack.delete()
+                await message.reply_photo(
+                    photo=io.BytesIO(img_bytes),
+                    caption=caption[:1024],
+                    reply_parameters=ReplyParameters(message_id=message.message_id),
+                )
             _last_image_at = time.monotonic()  # фиксируем только успешную генерацию
             _history[chat.id].append({"role": "user", "content": prompt})
             _history[chat.id].append({"role": "assistant", "content": f"[нарисовал картинку по запросу: {text}]"})
@@ -222,10 +247,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         _history[chat.id].append({"role": "assistant", "content": answer})
     except httpx.HTTPStatusError as e:
         log.error("HTTP %s от API: %s", e.response.status_code, e.response.text[:500])
-        await message.reply_text("Упс, API вернул ошибку. Попробуй ещё раз чуть позже.")
-    except (httpx.HTTPError, KeyError, ValueError) as e:
+        await _reply_error(message, ack, "Упс, API вернул ошибку. Попробуй ещё раз чуть позже.")
+    except Exception as e:  # заглушка не должна остаться без ответа
         log.error("Ошибка: %s", e)
-        await message.reply_text("Что-то пошло не так 🤖")
+        await _reply_error(message, ack, "Что-то пошло не так 🤖")
+
+
+async def _reply_error(message, ack, text: str) -> None:
+    """Ошибку пишем в заглушку, если она есть, чтобы не плодить сообщения."""
+    if ack is not None:
+        await ack.edit_text(text)
+    else:
+        await message.reply_text(text)
 
 
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
