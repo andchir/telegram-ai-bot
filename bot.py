@@ -34,6 +34,8 @@ SYSTEM_PROMPT = os.getenv(
 ).strip()
 BOT_NAME = os.getenv("BOT_NAME", "").strip()  # доп. имя для обращений (необязательно)
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
+# Лимит токенов на ответ основной модели; 0 = не ограничивать (параметр не отправляется)
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "0"))
 
 # Режим запуска: polling (по умолчанию, для локального запуска) или webhook
 BOT_MODE = os.getenv("BOT_MODE", "polling").strip().lower()
@@ -73,6 +75,16 @@ ACK_PHRASES = [
     if p.strip()
 ] or list(DEFAULT_ACK_PHRASES)
 
+# Fact-checking через PlusVibe (модель с доступом к поиску)
+FACTCHECK_MODEL = os.getenv("FACTCHECK_MODEL", "perplexity/sonar")
+FACTCHECK_SYSTEM_PROMPT = os.getenv(
+    "FACTCHECK_SYSTEM_PROMPT",
+    "Ты - профессиональный факт-чекер. Твоя задача - проверять новостные утверждения "
+    "на достоверность, опираясь на надежные источники. Отвечай структурированно: указывай "
+    "статус проверки (Правда / Ложь / Вводяще в заблуждение / Не подтверждено), приводи "
+    "краткое объяснение и ссылки на источники.",
+).strip()
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
@@ -88,6 +100,14 @@ IMAGE_TRIGGER_RE = re.compile(
     r"\b(нарисуй(те)?|нарисовать|рисуй|покажи\s+картинку|сгенерируй\s+(картинку|изображение|арт)|"
     r"сделай\s+(картинку|изображение|арт)|создай\s+(картинку|изображение|арт)|"
     r"draw|paint|generate\s+(an?\s+)?(image|picture|art))\b"
+)
+
+# Просьбы проверить факт (рус/англ)
+FACTCHECK_TRIGGER_RE = re.compile(
+    r"(?i)"
+    r"\b(правда\s+ли|действительно\s+ли|это\s+правда|"
+    r"факт[\s-]?чек|проверь\s+(факт|информацию|утверждение|новость|статью|на\s+достоверность)|"
+    r"fact[\s-]?check|is\s+it\s+true)\b"
 )
 
 
@@ -146,6 +166,9 @@ def format_remaining(seconds: float) -> str:
 
 
 async def ask_llm(messages: list[dict]) -> str:
+    payload = {"model": CHAT_MODEL, "messages": messages}
+    if MAX_TOKENS > 0:
+        payload["max_tokens"] = MAX_TOKENS
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
         resp = await client.post(
             f"{PLUSVIBE_BASE}/v1/chat/completions",
@@ -153,7 +176,28 @@ async def ask_llm(messages: list[dict]) -> str:
                 "Authorization": f"Bearer {PLUSVIBE_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={"model": CHAT_MODEL, "messages": messages},
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+
+async def fact_check(text: str) -> str:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        resp = await client.post(
+            f"{PLUSVIBE_BASE}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {PLUSVIBE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": FACTCHECK_MODEL,
+                "messages": [
+                    {"role": "user", "content": FACTCHECK_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+            },
         )
         resp.raise_for_status()
         data = resp.json()
@@ -237,6 +281,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             _history[chat.id].append({"role": "assistant", "content": f"[нарисовал картинку по запросу: {text}]"})
             return
 
+        if FACTCHECK_TRIGGER_RE.search(text):
+            ack = await message.reply_text(
+                random.choice(ACK_PHRASES),
+                reply_parameters=ReplyParameters(message_id=message.message_id),
+            )
+            await message.chat.send_action(ChatAction.TYPING)
+            verdict = await fact_check(prompt)
+            await ack.edit_text(verdict[:4000])  # лимит Telegram — 4096 символов
+            _history[chat.id].append({"role": "user", "content": prompt})
+            _history[chat.id].append({"role": "assistant", "content": verdict[:4000]})
+            return
+
         await message.chat.send_action(ChatAction.TYPING)
         history = list(_history[chat.id])
         answer = await ask_llm([{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": prompt}])
@@ -271,7 +327,8 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"• Отвечать на вопросы: обратись ко мне по имени (@{me.username} или просто «{me.first_name}») "
             "или процитируй моё сообщение;\n"
             "• Помнить контекст нашего разговора в этом чате;\n"
-            f"• Рисовать картинки по запросу «нарисуй …» — но не чаще раза в {minutes} мин.\n\n"
+            f"• Рисовать картинки по запросу «нарисуй …» — но не чаще раза в {minutes} мин;\n"
+            "• Проверять утверждения на достоверность: спроси «правда ли, что …» — найду источники.\n\n"
             f"Попробуй: «@{me.username}, привет!» или «@{me.username}, нарисуй котика»"
         )
 
