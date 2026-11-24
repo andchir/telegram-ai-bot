@@ -69,7 +69,9 @@ IMAGE_COOLDOWN_PHRASES = [
     for p in os.getenv("IMAGE_COOLDOWN_PHRASES", "|".join(DEFAULT_COOLDOWN_PHRASES)).split("|")
     if p.strip()
 ] or list(DEFAULT_COOLDOWN_PHRASES)
-_last_image_at: float | None = None  # момент последней успешной генерации (time.monotonic)
+# Момент последней успешной генерации (time.monotonic) по скоупу:
+# личка - ("user", user_id), группа - ("chat", chat_id)
+_last_image_at: dict[tuple[str, int], float] = {}
 
 # Мгновенные заглушки, пока бот выполняет долгую операцию (генерация картинки)
 DEFAULT_ACK_PHRASES = (
@@ -353,7 +355,6 @@ async def generate_image(prompt: str, on_tick=None) -> tuple[str, str] | None:
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global _last_image_at
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
@@ -376,9 +377,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     try:
         if IMAGE_TRIGGER_RE.search(text):
+            # лимит на генерацию свой для каждого пользователя в личке
+            # и для каждой группы, если бот в группе
+            scope = ("user", user.id) if chat.type == ChatType.PRIVATE else ("chat", chat.id)
             now = time.monotonic()
-            if _last_image_at is not None and now - _last_image_at < IMAGE_COOLDOWN:
-                remaining = IMAGE_COOLDOWN - (now - _last_image_at)
+            last = _last_image_at.get(scope)
+            if last is not None and now - last < IMAGE_COOLDOWN:
+                remaining = IMAGE_COOLDOWN - (now - last)
                 phrase = random.choice(IMAGE_COOLDOWN_PHRASES)
                 await message.reply_text(
                     f"{phrase} Следующую картинку нарисую через {format_remaining(remaining)}.",
@@ -420,7 +425,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     caption=caption[:1024],
                     reply_parameters=ReplyParameters(message_id=message.message_id),
                 )
-            _last_image_at = time.monotonic()  # фиксируем только успешную генерацию
+            _last_image_at[scope] = time.monotonic()  # фиксируем только успешную генерацию
             _history[chat.id].append({"role": "user", "content": prompt})
             _history[chat.id].append({"role": "assistant", "content": f"[нарисовал картинку по запросу: {text}]"})
             return
