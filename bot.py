@@ -182,6 +182,15 @@ def build_prompt(text: str, message) -> str:
     return text
 
 
+def strip_bot_mention(text: str, username: str, first_name: str) -> str:
+    """Убираем обращение к боту (@username / имя) из текста запроса к генератору."""
+    text = re.sub(rf"(?i)@{re.escape(username)}\b[,.!?]?", "", text)
+    for name in {first_name, BOT_NAME} - {"", username}:
+        if name:
+            text = re.sub(rf"(?i)\b{re.escape(name)}\b[,.!?]?", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
 def extract_image(data) -> tuple[str, str] | None:
     """Ищем в ответе медиа-API ('url'/'resultUrls' или 'b64_json'/'base64') рекурсивно."""
     if isinstance(data, dict):
@@ -464,11 +473,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 tg_file = await context.bot.get_file(edit_photo.file_id)
                 async with httpx.AsyncClient(timeout=60.0) as dl:
                     photo_bytes = (await dl.get(tg_file.file_path)).content
-                image = await edit_image(prompt, photo_bytes, on_tick=_tick)
+                image = await edit_image(strip_bot_mention(prompt, me.username, me.first_name), photo_bytes, on_tick=_tick)
             else:
                 caption = f"🎨 Запрос от {user.full_name}: {text}"
                 note = f"[нарисовал картинку по запросу: {text}]"
-                image = await generate_image(prompt, on_tick=_tick)
+                image = await generate_image(strip_bot_mention(prompt, me.username, me.first_name), on_tick=_tick)
             if image is None:
                 await ack.edit_text("Не смог разобрать ответ генератора картинок 😔")
                 return
