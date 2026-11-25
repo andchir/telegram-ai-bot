@@ -35,7 +35,7 @@ cp .env.example .env   # затем заполнить ключи
 | `GIGACHAT_OAUTH_URL` | OAuth-эндпоинт Сбера, по умолчанию `https://ngw.devices.sberbank.ru:9443/api/v2/oauth` |
 | `GIGACHAT_BASE` | Базовый URL GigaChat API, по умолчанию `https://api.giga.chat` |
 | `GIGACHAT_SCOPE` | Scope OAuth, по умолчанию `GIGACHAT_API_PERS` |
-| `GIGACHAT_VERIFY_SSL` | Проверка TLS-сертификата Сбера, по умолчанию `true`; `false` — если нет корневого сертификата Минцифры |
+| `GIGACHAT_VERIFY_SSL` | Проверка TLS-сертификата Сбера по системному хранилищу CA (туда ставится сертификат Минцифры), по умолчанию `true`; `false` — отключить |
 | `IMAGE_MODEL` | По умолчанию `gpt-image-2:white` |
 | `FACTCHECK_MODEL` | Модель для проверки фактов, по умолчанию `perplexity/sonar` |
 | `FACTCHECK_SYSTEM_PROMPT` | Системный промпт фактчекера (в коде — промпт по умолчанию) |

@@ -14,6 +14,7 @@ import logging.handlers
 import os
 import random
 import re
+import ssl
 import time
 import uuid
 from collections import defaultdict, deque
@@ -50,7 +51,7 @@ GIGACHAT_OAUTH_URL = os.getenv(
 ).strip()
 GIGACHAT_BASE = os.getenv("GIGACHAT_BASE", "https://api.giga.chat").rstrip("/")
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
-# false — если в системе нет корневого сертификата Минцифры для доменов Сбера
+# false — отключить проверку TLS (если сертификат Минцифры не установлен в систему)
 GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "true").strip().lower() not in ("0", "false", "no")
 MODEL2_KEYWORDS = [
     w.strip()
@@ -358,9 +359,10 @@ async def ask_gigachat(messages: list[dict]) -> str:
     payload = {"model": CHAT_MODEL2, "messages": messages}
     if MAX_TOKENS > 0:
         payload["max_tokens"] = MAX_TOKENS
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(120.0), verify=GIGACHAT_VERIFY_SSL
-    ) as client:
+    # verify=True в httpx использует бандл certifi, а не системное хранилище CA,
+    # куда устанавливается сертификат Минцифры, — поэтому контекст собираем сами
+    verify = ssl.create_default_context() if GIGACHAT_VERIFY_SSL else False
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0), verify=verify) as client:
         token = await get_gigachat_token(client)
         for attempt in range(2):  # при 401 обновляем токен и повторяем один раз
             resp = await client.post(
