@@ -729,7 +729,8 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", on_start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    # UpdateType.MESSAGE — только новые сообщения: без правок и реакций (лайков)
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, on_message))
 
     if BOT_MODE == "webhook":
         if not WEBHOOK_URL:
