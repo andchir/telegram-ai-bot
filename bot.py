@@ -1,6 +1,7 @@
 """Telegram-бот, который отвечает на обращения по имени/цитаты и рисует картинки.
 
-API: PlusVibe (https://plusvibeapi.ru) — чат gpt-6.1-sol, генерация gpt-image-2:white.
+Основной API: PlusVibe (https://plusvibeapi.ru) — чат, генерация картинок, фактчек.
+Вторая чат-модель по ключевому слову в сообщении: GigaChat (api.giga.chat, OAuth Сбера).
 Ключи и настройки — в .env (см. .env.example).
 """
 
@@ -14,6 +15,7 @@ import os
 import random
 import re
 import time
+import uuid
 from collections import defaultdict, deque
 
 import httpx
@@ -38,6 +40,23 @@ BOT_NAME = os.getenv("BOT_NAME", "").strip()  # доп. имя для обращ
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 # Лимит токенов на ответ основной модели; 0 = не ограничивать (параметр не отправляется)
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "0"))
+
+# Вторая чат-модель на отдельном API (GigaChat, Сбер); пустая CHAT_MODEL2 = отключено.
+# Вызывается ключевым словом из MODEL2_KEYWORDS в сообщении пользователя.
+CHAT_MODEL2 = os.getenv("CHAT_MODEL2", "").strip()
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY", "").strip()
+GIGACHAT_OAUTH_URL = os.getenv(
+    "GIGACHAT_OAUTH_URL", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+).strip()
+GIGACHAT_BASE = os.getenv("GIGACHAT_BASE", "https://api.giga.chat").rstrip("/")
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
+# false — если в системе нет корневого сертификата Минцифры для доменов Сбера
+GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "true").strip().lower() not in ("0", "false", "no")
+MODEL2_KEYWORDS = [
+    w.strip()
+    for w in os.getenv("MODEL2_KEYWORDS", "гигачат,гига,gigachat,giga").split(",")
+    if w.strip()
+]
 
 # Логирование: файл с ротацией по размеру; пустой LOG_FILE = только консоль
 LOG_FILE = os.getenv("LOG_FILE", "bot.log").strip()
@@ -156,6 +175,21 @@ IMAGE_EDIT_RE = re.compile(
     r"сделай\s+(его|е[ёе]|ярче|темнее|ч[её]рно|цветн)|в\s+стиле|"
     r"edit|replace|remove|change|redraw|make\s+it)\b"
 )
+
+# Ключевые слова выбора второй чат-модели (MODEL2_KEYWORDS из .env)
+MODEL2_RE = (
+    re.compile(r"(?i)\b(" + "|".join(re.escape(w) for w in MODEL2_KEYWORDS) + r")\b")
+    if MODEL2_KEYWORDS
+    else None
+)
+
+
+def strip_model2_keyword(text: str) -> str:
+    """Вырезаем слово-триггер второй модели вместе с осиротевшими запятыми."""
+    text = MODEL2_RE.sub("", text)
+    text = re.sub(r",(\s*,)+", ",", text)
+    text = re.sub(r"^[\s,.!?;:]+", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def mentions_bot(text: str, username: str, first_name: str) -> bool:
@@ -291,6 +325,60 @@ async def ask_llm(messages: list[dict]) -> str:
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
+
+
+# Кэш OAuth-токена GigaChat: живёт ~30 минут, обновляем по expires_at с минутным запасом
+_gigachat_token: str | None = None
+_gigachat_token_deadline = 0.0  # time.monotonic
+
+
+async def get_gigachat_token(client: httpx.AsyncClient, force_refresh: bool = False) -> str:
+    global _gigachat_token, _gigachat_token_deadline
+    if not force_refresh and _gigachat_token and time.monotonic() < _gigachat_token_deadline:
+        return _gigachat_token
+    resp = await client.post(
+        GIGACHAT_OAUTH_URL,
+        headers={
+            "Accept": "application/json",
+            "RqUID": str(uuid.uuid4()),
+            "Authorization": f"Bearer {GIGACHAT_AUTH_KEY}",
+        },
+        data={"scope": GIGACHAT_SCOPE},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    _gigachat_token = data["access_token"]
+    ttl = float(data.get("expires_at", 0)) / 1000 - time.time() - 60
+    _gigachat_token_deadline = time.monotonic() + max(60.0, ttl)
+    log.info("Получен токен GigaChat, действует %.0f сек", max(60.0, ttl))
+    return _gigachat_token
+
+
+async def ask_gigachat(messages: list[dict]) -> str:
+    payload = {"model": CHAT_MODEL2, "messages": messages}
+    if MAX_TOKENS > 0:
+        payload["max_tokens"] = MAX_TOKENS
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0), verify=GIGACHAT_VERIFY_SSL
+    ) as client:
+        token = await get_gigachat_token(client)
+        for attempt in range(2):  # при 401 обновляем токен и повторяем один раз
+            resp = await client.post(
+                f"{GIGACHAT_BASE}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=payload,
+            )
+            if resp.status_code == 401 and attempt == 0:
+                token = await get_gigachat_token(client, force_refresh=True)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+    raise RuntimeError("GigaChat: не удалось выполнить запрос")
 
 
 async def fact_check(text: str) -> str:
@@ -434,6 +522,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     text = message.text
+    # Ключевое слово второй модели: вырезаем его из текста и запоминаем выбор
+    use_model2 = bool(CHAT_MODEL2 and MODEL2_RE and MODEL2_RE.search(text))
+    if use_model2:
+        text = strip_model2_keyword(text) or text
+        if not GIGACHAT_AUTH_KEY:
+            use_model2 = False
+            await message.reply_text("GigaChat не настроен (нет GIGACHAT_AUTH_KEY), отвечу основной моделью.")
     prompt = build_prompt(text, message)
     ack = None  # заглушка, отправленная сразу; по завершении редактируется в результат
 
@@ -525,7 +620,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         await message.chat.send_action(ChatAction.TYPING)
         history = list(_history[chat.id])
-        answer = await ask_llm([{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": prompt}])
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": prompt}]
+        if use_model2:
+            # перед ответом неосновной модели предупреждаем об этом отдельным сообщением
+            await message.reply_text(
+                f"🔀 Отвечает {CHAT_MODEL2} — не основная модель.",
+                reply_parameters=ReplyParameters(message_id=message.message_id),
+            )
+            answer = await ask_gigachat(messages)
+        else:
+            answer = await ask_llm(messages)
         if not answer:
             answer = "…"
         await send_formatted(
@@ -565,6 +669,11 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         me = await context.bot.get_me()
         minutes = max(1, IMAGE_COOLDOWN // 60)
+        model2_hint = (
+            f"• Отвечу другой моделью ({CHAT_MODEL2}), если добавить в сообщение слово «{MODEL2_KEYWORDS[0]}».\n"
+            if CHAT_MODEL2 and MODEL2_RE
+            else ""
+        )
         await update.effective_message.reply_text(
             f"Привет! Я {me.first_name} — ИИ-ассистент в этом чате.\n\n"
             "Что я умею:\n"
@@ -573,8 +682,9 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "или процитируют моё сообщение;\n"
             "• Помнить контекст нашего разговора в этом чате;\n"
             f"• Рисовать картинки по запросу «нарисуй …» — но не чаще раза в {minutes} мин;\n"
-            "• Проверять утверждения на достоверность: спроси «правда ли, что …» — найду источники.\n\n"
-            f"Попробуй: «@{me.username}, привет!» или «@{me.username}, нарисуй котика»"
+            "• Проверять утверждения на достоверность: спроси «правда ли, что …» — найду источники.\n"
+            f"{model2_hint}"
+            f"\nПопробуй: «@{me.username}, привет!» или «@{me.username}, нарисуй котика»"
         )
 
 
