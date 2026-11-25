@@ -1,6 +1,6 @@
 """Telegram-бот, который отвечает на обращения по имени/цитаты и рисует картинки.
 
-Основной API: PlusVibe (https://plusvibeapi.ru) — чат, генерация картинок, фактчек.
+Основной API: PlusVibe (https://plusvibeapi.ru) — чат, генерация картинок, фактчек и поиск.
 Вторая чат-модель по ключевому слову в сообщении: GigaChat (api.giga.chat, OAuth Сбера).
 Ключи и настройки — в .env (см. .env.example).
 """
@@ -122,6 +122,20 @@ FACTCHECK_SYSTEM_PROMPT = os.getenv(
     "Ссылки давай только полными URL в формате Markdown.",
 ).strip()
 
+# Поиск информации через ту же модель (FACTCHECK_MODEL), но без статуса достоверности
+SEARCH_SYSTEM_PROMPT = os.getenv(
+    "SEARCH_SYSTEM_PROMPT",
+    "Ты - поисковый ассистент. Твоя задача - найти актуальную информацию по запросу "
+    "пользователя и изложить её структурированно, опираясь на надежные источники. "
+    "Отвечай по делу и без оценки достоверности - просто информация по запросу.\n"
+    "В тексте ссылайся на источники номерами в квадратных скобках: [1], [2] и т.д. "
+    "Нумерация - строго по порядку первого упоминания, без пропусков.\n"
+    "В конце обязательный блок «Источники:» с НУМЕРОВАННЫМ списком: "
+    "«1. [название](https://реальный-url)». Номер в списке должен точно совпадать с номером "
+    "в тексте: каждому [N] в тексте - ровно одна ссылка N в списке. "
+    "Ссылки давай только полными URL в формате Markdown.",
+).strip()
+
 def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -166,6 +180,15 @@ FACTCHECK_TRIGGER_RE = re.compile(
     r"\b(правда\s+ли|действительно\s+ли|это\s+правда|"
     r"факт[\s-]?чек|проверь\s+(факт|информацию|утверждение|новость|статью|на\s+достоверность)|"
     r"fact[\s-]?check|is\s+it\s+true)\b"
+)
+
+# Просьбы найти информацию (рус/англ) — поиск без оценки достоверности
+SEARCH_TRIGGER_RE = re.compile(
+    r"(?i)"
+    r"\b(найди(те)?\s+(информацию|инфу|данные|сведения|про)|"
+    r"поищи(те)?(\s+(информацию|инфу|про))?|поиск\s+(информации|по\s+запросу)|"
+    r"погугли(те)?|загугли(те)?|"
+    r"search(\s+for)?|find\s+(info|information)|google)\b"
 )
 
 # Ключевые слова правки изображения (работают с процитированной картинкой)
@@ -383,7 +406,8 @@ async def ask_gigachat(messages: list[dict]) -> str:
     raise RuntimeError("GigaChat: не удалось выполнить запрос")
 
 
-async def fact_check(text: str) -> str:
+async def ask_sonar(system_prompt: str, text: str) -> str:
+    """Запрос к Sonar (фактчек или поиск) — различаются только системным промптом."""
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
         resp = await client.post(
             f"{PLUSVIBE_BASE}/v1/chat/completions",
@@ -394,7 +418,7 @@ async def fact_check(text: str) -> str:
             json={
                 "model": FACTCHECK_MODEL,
                 "messages": [
-                    {"role": "user", "content": FACTCHECK_SYSTEM_PROMPT},
+                    {"role": "user", "content": system_prompt},
                     {"role": "user", "content": text},
                 ],
             },
@@ -604,13 +628,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             _history[chat.id].append({"role": "assistant", "content": note})
             return
 
+        # Фактчек и поиск идут через одну модель (Sonar), различаются системным промптом
+        sonar_system = None
         if FACTCHECK_TRIGGER_RE.search(text):
+            sonar_system = FACTCHECK_SYSTEM_PROMPT
+        elif SEARCH_TRIGGER_RE.search(text):
+            sonar_system = SEARCH_SYSTEM_PROMPT
+        if sonar_system is not None:
             ack = await message.reply_text(
                 random.choice(ACK_PHRASES),
                 reply_parameters=ReplyParameters(message_id=message.message_id),
             )
             await message.chat.send_action(ChatAction.TYPING)
-            verdict = await fact_check(prompt)
+            verdict = await ask_sonar(sonar_system, prompt)
             formatted = md_to_tg_html(verdict)
             try:
                 await ack.edit_text(safe_truncate_html(formatted), parse_mode=ParseMode.HTML)
@@ -684,7 +714,8 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "или процитируют моё сообщение;\n"
             "• Помнить контекст нашего разговора в этом чате;\n"
             f"• Рисовать картинки по запросу «нарисуй …» — но не чаще раза в {minutes} мин;\n"
-            "• Проверять утверждения на достоверность: спроси «правда ли, что …» — найду источники.\n"
+            "• Проверять утверждения на достоверность: спроси «правда ли, что …» — найду источники;\n"
+            "• Искать информацию по запросу: «найди информацию про …» — расскажу и дам источники.\n"
             f"{model2_hint}"
             f"\nПопробуй: «@{me.username}, привет!» или «@{me.username}, нарисуй котика»"
         )
