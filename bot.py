@@ -72,6 +72,14 @@ WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0").strip()
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip() or None
 
+# Ответ, когда процитированное сообщение не содержит читаемого текста
+NO_QUOTED_TEXT_MESSAGE = os.getenv(
+    "NO_QUOTED_TEXT_MESSAGE",
+    "Не могу прочитать процитированное сообщение — в нём нет текста "
+    "(медиа без подписи, стикер или служебное сообщение). "
+    "Пришли нужный текст отдельным сообщением, и я разберусь.",
+).strip()
+
 # Антиспам генерации картинок: минимальный интервал между генерациями, секунды
 IMAGE_COOLDOWN = int(os.getenv("IMAGE_COOLDOWN_SECONDS", "600"))
 # Асинхронная генерация: интервал опроса джобы и общий таймаут ожидания, секунды
@@ -231,13 +239,43 @@ def is_reply_to_bot(message, bot_id: int) -> bool:
     return reply is not None and reply.from_user is not None and reply.from_user.id == bot_id
 
 
+def describe_message_author(message) -> str | None:
+    """Имя автора сообщения: обычное или из forward_origin (скрытая пересылка)."""
+    if message.from_user is not None:
+        return message.from_user.full_name
+    # анонимный админ группы / сообщение от имени чата
+    if getattr(message, "sender_chat", None) is not None:
+        return message.sender_chat.title
+    origin = message.forward_origin
+    if origin is None:
+        return None
+    sender_user = getattr(origin, "sender_user", None)  # MessageOriginUser
+    if sender_user is not None:
+        return sender_user.full_name
+    sender_name = getattr(origin, "sender_user_name", None)  # MessageOriginHiddenUser
+    if sender_name:
+        return sender_name
+    sender_chat = getattr(origin, "sender_chat", None)  # MessageOriginChat
+    if sender_chat is not None:
+        return sender_chat.title
+    origin_chat = getattr(origin, "chat", None)  # MessageOriginChannel
+    if origin_chat is not None:
+        return origin_chat.title
+    return None
+
+
 def build_prompt(text: str, message) -> str:
     """Подставляем процитированное сообщение как контекст, если оно не от бота."""
     reply = message.reply_to_message
-    if reply is not None and reply.from_user is not None and reply.text and not reply.from_user.is_bot:
-        author = reply.from_user.full_name
-        return f"[Контекст: цитируется сообщение от {author}: «{reply.text}»]\n\n{text}"
-    return text
+    if reply is None:
+        return text
+    if reply.from_user is not None and reply.from_user.is_bot:
+        return text
+    content = reply.text or reply.caption
+    if not content:
+        return text
+    author = describe_message_author(reply) or "неизвестный отправитель"
+    return f"[Контекст: цитируется сообщение от {author}: «{content}»]\n\n{text}"
 
 
 def strip_bot_mention(text: str, username: str, first_name: str) -> str:
@@ -626,6 +664,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             _last_image_at[scope] = time.monotonic()  # фиксируем только успешную генерацию
             _history[chat.id].append({"role": "user", "content": prompt})
             _history[chat.id].append({"role": "assistant", "content": note})
+            return
+
+        # Цитата без читаемого текста: контекста для ответа нет,
+        # честно сообщаем об этом вместо «слепого» ответа на сам текст обращения
+        reply = message.reply_to_message
+        if (
+            reply is not None
+            and not (reply.from_user is not None and reply.from_user.is_bot)
+            and not (reply.text or reply.caption)
+        ):
+            await message.reply_text(
+                NO_QUOTED_TEXT_MESSAGE,
+                reply_parameters=ReplyParameters(message_id=message.message_id),
+            )
             return
 
         # Фактчек и поиск идут через одну модель (Sonar), различаются системным промптом
