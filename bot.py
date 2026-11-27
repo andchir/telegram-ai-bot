@@ -278,6 +278,22 @@ def build_prompt(text: str, message) -> str:
     return f"[Контекст: цитируется сообщение от {author}: «{content}»]\n\n{text}"
 
 
+def build_factcheck_quote(message) -> str:
+    """Полный проверяемый текст с именем автора для начала ответа фактчекера."""
+    source = message
+    reply = message.reply_to_message
+    if (
+        reply is not None
+        and not (reply.from_user is not None and reply.from_user.is_bot)
+        and (reply.text or reply.caption)
+    ):
+        source = reply
+    content = source.text or source.caption
+    author = describe_message_author(source) or "неизвестный отправитель"
+    quote = "\n".join(f"> {line}" for line in content.split("\n"))
+    return f"**Проверяемая информация — {author}:**\n{quote}"
+
+
 def strip_bot_mention(text: str, username: str, first_name: str) -> str:
     """Убираем обращение к боту (@username / имя) из текста запроса к генератору."""
     text = re.sub(rf"(?i)@{re.escape(username)}\b[,.!?]?", "", text)
@@ -350,6 +366,12 @@ def md_to_tg_html(text: str) -> str:
     out = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", out)
     out = re.sub(r"(?m)^#{1,6}\s*(.+?)\s*#*\s*$", r"<b>\1</b>", out)
     out = re.sub(r"(?im)^\s*(источники:?)\s*$", r"<b>\1</b>", out)
+
+    def _blockquote(m: re.Match) -> str:
+        quote = re.sub(r"(?m)^&gt; ?", "", m.group(0)).strip("\n")
+        return f"<blockquote>{quote}</blockquote>"
+
+    out = re.sub(r"(?m)(?:^&gt; ?.*(?:\n|$))+", _blockquote, out)
     out = re.sub(r"\x00(\d+)\x00", lambda m: "<pre>" + blocks[int(m.group(1))] + "</pre>", out)
     return out
 
@@ -682,7 +704,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         # Фактчек и поиск идут через одну модель (Sonar), различаются системным промптом
         sonar_system = None
-        if FACTCHECK_TRIGGER_RE.search(text):
+        is_factcheck = bool(FACTCHECK_TRIGGER_RE.search(text))
+        if is_factcheck:
             sonar_system = FACTCHECK_SYSTEM_PROMPT
         elif SEARCH_TRIGGER_RE.search(text):
             sonar_system = SEARCH_SYSTEM_PROMPT
@@ -693,6 +716,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             await message.chat.send_action(ChatAction.TYPING)
             verdict = await ask_sonar(sonar_system, prompt)
+            if is_factcheck:
+                verdict = f"{build_factcheck_quote(message)}\n\n{verdict}"
             formatted = md_to_tg_html(verdict)
             try:
                 await ack.edit_text(safe_truncate_html(formatted), parse_mode=ParseMode.HTML)
